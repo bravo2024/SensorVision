@@ -1,30 +1,89 @@
 from __future__ import annotations
-import numpy as np; import pandas as pd
-FEATURE_NAMES = ["pixel_intensity_mean","pixel_intensity_std","edge_count","blob_count","defect_area_pct","symmetry_score","texture_uniformity","color_variance","gradient_magnitude","contrast_ratio","frequency_peak","entropy","product_type"]
-CATEGORICAL_FEATURES = ["product_type"]
-NUMERICAL_FEATURES = ["pixel_intensity_mean","pixel_intensity_std","edge_count","blob_count","defect_area_pct","symmetry_score","texture_uniformity","color_variance","gradient_magnitude","contrast_ratio","frequency_peak","entropy"]
-TARGET_NAME = "has_defect"
-def make_synthetic(n=10000,seed=42):
-    rng=np.random.default_rng(seed)
-    df=pd.DataFrame({
-        "pixel_intensity_mean": rng.normal(128,20,size=n).clip(0,255).round(1),
-        "pixel_intensity_std": rng.uniform(10,60,size=n).round(1),
-        "edge_count": rng.poisson(lam=200,size=n).clip(10,1000),
-        "blob_count": rng.poisson(lam=15,size=n).clip(1,100),
-        "defect_area_pct": rng.beta(1,15,size=n).round(4),
-        "symmetry_score": rng.beta(6,2,size=n).round(3),
-        "texture_uniformity": rng.beta(4,3,size=n).round(3),
-        "color_variance": rng.uniform(0,100,size=n).round(1),
-        "gradient_magnitude": rng.uniform(0,100,size=n).round(1),
-        "contrast_ratio": rng.uniform(0,1,size=n).round(3),
-        "frequency_peak": rng.uniform(0,1,size=n).round(3),
-        "entropy": rng.uniform(1,8,size=n).round(2),
-        "product_type": rng.choice(["circuit_board","metal_part","plastic_mold","textile","glass"],size=n,p=[0.30,0.20,0.20,0.15,0.15]),
-    })
-    defect=df["defect_area_pct"]; sym=df["symmetry_score"]; tex=df["texture_uniformity"]
-    grad=df["gradient_magnitude"]/100; edge=np.clip(df["edge_count"]/1000,0,1)
-    blob=np.clip(df["blob_count"]/100,0,1); color=df["color_variance"]/100
-    freq=df["frequency_peak"]; ent=np.clip(df["entropy"]/8,0,1); prod=df["product_type"].map({"circuit_board":0,"metal_part":0.2,"plastic_mold":0.4,"textile":0.6,"glass":0.8}).values
-    log_odds = -3.0 + 2.0*defect - 0.4*sym - 0.3*tex + 0.3*grad + 0.2*edge + 0.3*blob + 0.2*color + 0.1*freq + 0.2*ent + 0.1*prod + rng.normal(0,0.5,size=n)
-    prob=1/(1+np.exp(-log_odds)); y=(prob>np.percentile(prob,88)).astype(np.float64)
-    return {"X":df,"y":y,"features":FEATURE_NAMES,"df":df.assign(has_defect=y),"categorical_features":CATEGORICAL_FEATURES,"numerical_features":NUMERICAL_FEATURES,"n_samples":n,"n_features":len(FEATURE_NAMES),"positive_rate":y.mean()}
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+SIGNAL_LENGTH = 1024
+FAULT_CLASSES = ["normal", "bearing_fault", "imbalance", "misalignment", "crack"]
+NUM_CLASSES = len(FAULT_CLASSES)
+
+def _normal_signal(rng, length=SIGNAL_LENGTH):
+    t = np.linspace(0, 4 * np.pi, length)
+    sig = (np.sin(t * 10) + 0.5 * np.sin(t * 25) + 0.25 * np.sin(t * 50)
+           + rng.normal(0, 0.05, length))
+    return sig
+
+def _bearing_fault_signal(rng, length=SIGNAL_LENGTH):
+    t = np.linspace(0, 4 * np.pi, length)
+    sig = (np.sin(t * 10) + 0.5 * np.sin(t * 25)
+           + 0.8 * np.sin(t * 60) + 0.3 * np.sin(t * 120)
+           + rng.normal(0, 0.08, length))
+    pulses = np.zeros(length)
+    for i in range(0, length, rng.integers(20, 40)):
+        pulses[i:i+5] = rng.uniform(0.5, 1.5)
+    return sig + pulses
+
+def _imbalance_signal(rng, length=SIGNAL_LENGTH):
+    t = np.linspace(0, 4 * np.pi, length)
+    mod = 1 + 0.6 * np.sin(t * 3)
+    sig = (mod * np.sin(t * 10) + 0.3 * np.sin(t * 20) + rng.normal(0, 0.06, length))
+    return sig
+
+def _misalignment_signal(rng, length=SIGNAL_LENGTH):
+    t = np.linspace(0, 4 * np.pi, length)
+    sig = (np.sin(t * 10 + 0.3 * np.sin(t * 2))
+           + 0.6 * np.sin(t * 20 + 0.2 * np.sin(t * 3))
+           + 0.3 * np.sin(t * 30) + rng.normal(0, 0.07, length))
+    return sig
+
+def _crack_signal(rng, length=SIGNAL_LENGTH):
+    t = np.linspace(0, 4 * np.pi, length)
+    sig = (np.sin(t * 10) + 0.4 * np.sin(t * 25)
+           + rng.normal(0, 0.1, length))
+    for i in range(0, length, rng.integers(50, 100)):
+        drop = rng.uniform(0.3, 0.7)
+        sig[i:i+rng.integers(10, 30)] *= drop
+    return sig
+
+GENERATORS = [_normal_signal, _bearing_fault_signal, _imbalance_signal, _misalignment_signal, _crack_signal]
+
+def make_synthetic(n_per_class=200, signal_length=SIGNAL_LENGTH, seed=42):
+    rng = np.random.default_rng(seed)
+    signals, labels = [], []
+    for cls_idx, gen in enumerate(GENERATORS):
+        for _ in range(n_per_class):
+            sig = gen(rng, signal_length)
+            signals.append(torch.from_numpy(sig).float().unsqueeze(0))
+            labels.append(cls_idx)
+    data = {
+        "signals": torch.stack(signals),
+        "labels": torch.tensor(labels, dtype=torch.long),
+        "class_names": FAULT_CLASSES,
+        "num_classes": NUM_CLASSES,
+        "n_samples": len(signals),
+        "signal_length": signal_length,
+    }
+    return data
+
+class SensorDataset(Dataset):
+    def __init__(self, data, split="train", val_split=0.2, seed=42):
+        n = data["n_samples"]
+        rng = np.random.default_rng(seed)
+        idx = rng.permutation(n)
+        split_n = int(n * (1 - val_split))
+        indices = idx[:split_n] if split == "train" else idx[split_n:]
+        self.signals = data["signals"][indices]
+        self.labels = data["labels"][indices]
+
+    def __len__(self):
+        return len(self.signals)
+
+    def __getitem__(self, idx):
+        return self.signals[idx], self.labels[idx]
+
+def create_dataloaders(data, batch_size=32, val_split=0.2, seed=42):
+    train_ds = SensorDataset(data, "train", val_split, seed)
+    val_ds = SensorDataset(data, "val", val_split, seed)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size)
+    return train_loader, val_loader

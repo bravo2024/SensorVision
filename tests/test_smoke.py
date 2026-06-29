@@ -1,8 +1,40 @@
 from __future__ import annotations
 import sys; from pathlib import Path; sys.path.insert(0, str(Path(__file__).parent.parent))
-import numpy as np; from src.data import make_synthetic; from src.model import train_all_models, cross_validate
-def test_data(): d=make_synthetic(500); assert d["X"].shape[0]==500 and 0.02<d["positive_rate"]<0.5
-def test_train(): d=make_synthetic(300); b=train_all_models(d); assert len(b["models"])==4
-def test_xgb(): d=make_synthetic(300); assert train_all_models(d)["results"]["XGBoost"]["metrics"].get("roc_auc",0)>0.5
-def test_cv(): d=make_synthetic(400); cv=cross_validate(d,seed=42,n_folds=3); assert all(s["roc_auc"]["mean"]>0.5 for s in cv.values())
-def test_metrics(): d=make_synthetic(200); b=train_all_models(d); m=b["results"]["XGBoost"]["metrics"]; assert all(0<=m[k]<=1 for k in ["accuracy","precision","recall","f1"])
+import torch
+from src.data import make_synthetic, create_dataloaders
+from src.model import MultiScale1DCNN
+from src.core import compute_sensor_metrics
+
+def test_data():
+    data = make_synthetic(n_per_class=10, seed=42)
+    assert data["signals"].shape == (50, 1, 1024)
+    assert data["num_classes"] == 5
+    assert len(data["class_names"]) == 5
+
+def test_dataloader():
+    data = make_synthetic(n_per_class=10, seed=42)
+    tl, vl = create_dataloaders(data, batch_size=8)
+    batch = next(iter(tl))
+    assert batch[0].shape == (8, 1, 1024)
+    assert batch[1].shape == (8,)
+
+def test_model():
+    model = MultiScale1DCNN(num_classes=5)
+    x = torch.randn(2, 1, 1024)
+    out = model(x)
+    assert out.shape == (2, 5)
+
+def test_metrics():
+    preds = torch.randint(0, 5, (100,)).numpy()
+    labels = torch.randint(0, 5, (100,)).numpy()
+    m = compute_sensor_metrics(preds, labels, ["a", "b", "c", "d", "e"])
+    assert 0 <= m["accuracy"] <= 1
+    assert len(m["per_class"]) == 5
+
+def test_forward_pass():
+    model = MultiScale1DCNN(num_classes=5)
+    model.eval()
+    with torch.no_grad():
+        out = model(torch.randn(1, 1, 1024))
+    assert out.shape == (1, 5)
+    assert out.argmax(dim=1).item() in range(5)
